@@ -1,0 +1,74 @@
+{
+  "name": "comic-app",
+  "private": true,
+  "version": "0.0.3",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "start-desktop": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "npm run build && electron-builder",
+    "publish": "npm run build && electron-builder -p always"
+  },
+  "dependencies": {
+    "@google/genai": "^2.21.0",
+    "axios": "^1.20.0",
+    "capcut-cli": "^0.25.0",
+    "cors": "^2.8.6",
+    "electron-updater": "^6.8.9",
+    "express": "^5.2.1",
+    "fluent-ffmpeg": "^2.1.3",
+    "playwright": "^1.62.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.1.0",
+    "electron": "^44.2.0",
+    "electron-builder": "^26.15.3",
+    "oxlint": "^1.79.0",
+    "vite": "^8.2.2"
+  },
+  "main": "electron-main.cjs",
+  "repository": "https://github.com/namnguyen119944/Review-Auto-Creator",
+  "build": {
+    "appId": "com.review.comicapp",
+    "productName": "Comic Review Auto-Creator",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "**/*",
+      "!src/*",
+      "!release/*",
+      "!.git/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "namnguyen119944",
+        "repo": "Review-Auto-Creator"
+      }
+    ]
+  }
+}

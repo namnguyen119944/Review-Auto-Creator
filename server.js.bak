@@ -1,0 +1,577 @@
+import express from 'express';
+import cors from 'cors';
+import { chromium } from 'playwright';
+import fs from 'fs';
+import path from 'path';
+import axios from 'axios';
+import { exec } from 'child_process';
+import util from 'util';
+import { GoogleGenAI } from '@google/genai';
+
+const execPromise = util.promisify(exec);
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// CAUTION: Replace with your actual API key
+const GEMINI_API_KEY = 'sk-tknq9BYKDgSKWKBkchPm8oZxgZZwYBKUA1NvVbU5JSNB9qRE'; 
+
+const ai = new GoogleGenAI({
+  apiKey: GEMINI_API_KEY,
+  httpOptions: { baseUrl: 'https://api.yescale.io' }
+});
+
+
+app.get('/api/choose-folder', async (req, res) => {
+  try {
+    const tempFile = path.join(process.cwd(), 'temp_path.txt');
+    const psCommand = `
+      Add-Type -AssemblyName System.windows.forms;
+      $owner = New-Object System.Windows.Forms.Form;
+      $owner.TopMost = $true;
+      $owner.ShowInTaskbar = $false;
+      $owner.WindowState = 'Minimized';
+      $f = New-Object System.Windows.Forms.FolderBrowserDialog;
+      $f.Description = 'Chọn thư mục để lưu ảnh truyện';
+      if ($f.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+          [IO.File]::WriteAllText('${tempFile.replace(/\\/g, '\\\\')}', $f.SelectedPath, [System.Text.Encoding]::UTF8)
+      } else {
+          [IO.File]::WriteAllText('${tempFile.replace(/\\/g, '\\\\')}', '', [System.Text.Encoding]::UTF8)
+      }
+    `;
+    
+    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+    await execPromise(`powershell -NoProfile -Command "${psCommand.replace(/\n/g, ' ')}"`);
+    
+    if (fs.existsSync(tempFile)) {
+        const selectedPath = fs.readFileSync(tempFile, 'utf8').trim();
+        fs.unlinkSync(tempFile);
+        res.json({ path: selectedPath });
+    } else {
+        res.json({ path: '' });
+    }
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Không thể mở hộp thoại chọn thư mục.' });
+  }
+});
+
+app.post('/api/download', async (req, res) => {
+  const { url, outputDir } = req.body;
+  
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  const sendLog = (msg) => {
+    res.write(`data: ${JSON.stringify({ type: 'log', message: msg })}\n\n`);
+  };
+
+  if (!url) {
+    res.write(`data: ${JSON.stringify({ type: 'error', message: 'Vui lòng cung cấp URL' })}\n\n`);
+    return res.end();
+  }
+  if (!outputDir || !fs.existsSync(outputDir)) {
+    res.write(`data: ${JSON.stringify({ type: 'error', message: 'Thư mục không tồn tại. Vui lòng chọn lại thư mục.' })}\n\n`);
+    return res.end();
+  }
+
+  let context;
+  try {
+    sendLog(`📁 Ảnh sẽ được lưu tại: ${outputDir}`);
+    
+    // TẠO MỘT PROFILE ĐỘC LẬP CHO TOOL ĐỂ KHÔNG XUNG ĐỘT VỚI CHROME CỦA NGƯỜI DÙNG
+    const toolProfileDir = path.join(process.cwd(), 'tool_profile');
+    if (!fs.existsSync(toolProfileDir)) {
+        fs.mkdirSync(toolProfileDir, { recursive: true });
+    }
+    
+    sendLog(`🌐 Đang mở trình duyệt Chrome siêu ẩn danh (Độc lập 100%)...`);
+    
+    try {
+        context = await chromium.launchPersistentContext(toolProfileDir, {
+            headless: false,
+            channel: 'chrome', // Dùng Chrome thật
+            ignoreDefaultArgs: ["--enable-automation"], // XÓA cờ Automation để lừa Google
+            args: [
+                '--disable-blink-features=AutomationControlled', // Vượt rào chống Bot của Google
+                '--disable-web-security',
+                '--window-position=0,0'
+            ]
+            // KHÔNG override userAgent vì làm lệch vân tay trình duyệt (Cloudflare sẽ chặn)
+        });
+        sendLog(`✅ Bạn hoàn toàn có thể vừa chạy Tool, vừa lướt Chrome cá nhân làm việc khác bình thường!`);
+    } catch (e) {
+        throw e;
+    }
+    
+    let page;
+    const pages = context.pages();
+    if (pages.length > 0) {
+        const normalPage = pages.find(p => !p.url().startsWith('chrome-extension://'));
+        page = normalPage || await context.newPage();
+    } else {
+        page = await context.newPage();
+    }
+    
+    // BẮT MỌI REQUEST ẢNH TỪ NETWORK (Bypass 100% lỗi onerror làm mất URL trong DOM)
+    const networkImgUrls = new Set();
+    page.on('request', request => {
+        if (request.resourceType() === 'image') {
+            const reqUrl = request.url();
+            if (reqUrl.startsWith('http')) {
+                const lower = reqUrl.toLowerCase();
+                if (!lower.includes('logo') && !lower.includes('icon') && !lower.includes('avatar') && !lower.includes('banner') && !lower.includes('qc')) {
+                    networkImgUrls.add(reqUrl);
+                }
+            }
+        }
+    });
+    
+    // Tàng hình thêm để vượt Cloudflare Turnstile của truyenqq
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+    });
+    
+    await page.bringToFront();
+    
+    sendLog(`⏳ Đang tải trang web truyện...`);
+    
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => {
+        sendLog(`⚠️ Cảnh báo tải trang: ${e.message}`);
+    });
+
+    sendLog("⏳ Đang chờ 10 giây để trang web tải toàn bộ nội dung...");
+    await page.waitForTimeout(10000);
+    const title = await page.title();
+    sendLog(`📑 Tiêu đề trang hiện tại: ${title}`);
+    
+    if (title.toLowerCase().includes('login') || title.toLowerCase().includes('đăng nhập') || title.toLowerCase().includes('about:blank')) {
+        sendLog(`🚨 CHÚ Ý: Vì đây là môi trường hoàn toàn mới, trang web yêu cầu bạn ĐĂNG NHẬP LẦN ĐẦU TIÊN.`);
+        sendLog(`💡 Tool sẽ tạm dừng 60 GIÂY. Bạn hãy cứ đăng nhập bằng Gmail bình thường (Tool đã tắt cờ Bot nên Google sẽ không chặn nữa).`);
+        sendLog(`⚠️ Từ những lần sau, Tool sẽ tự nhớ tài khoản của bạn, không cần đăng nhập lại!`);
+        await page.waitForTimeout(60000);
+    }
+
+    sendLog("📜 Đang cuộn trang để kích hoạt thuật toán Lazy-load ẩn ảnh...");
+    for (let i = 0; i < 30; i++) {
+      await page.mouse.wheel(0, 1000);
+      await page.waitForTimeout(500);
+    }
+
+    sendLog("⏳ Đang chờ thêm 10 giây để chắc chắn TẤT CẢ ảnh đã tải xong hoàn toàn...");
+    await page.waitForTimeout(10000);
+
+    // THỬ TRÍCH XUẤT TỪ MÃ NGUỒN JS (Cách này sẽ không bao giờ bị xót ảnh do mạng yếu)
+    let jsUrls = await page.evaluate(() => {
+        try {
+            // Các biến phổ biến chứa mảng ảnh trên các trang truyện
+            const possibleArrays = [
+                window.chapter_images, window.image_list, window.images, window.img_array, window.list_image
+            ];
+            for (const arr of possibleArrays) {
+                if (Array.isArray(arr) && arr.length > 0 && typeof arr[0] === 'string' && arr[0].startsWith('http')) {
+                    return arr;
+                }
+            }
+        } catch(e) {}
+        return null;
+    });
+
+    let urlsArray = [];
+    if (jsUrls && jsUrls.length > 0) {
+        urlsArray = jsUrls;
+        sendLog(`✅ Thành công trích xuất ${urlsArray.length} ảnh trực tiếp từ dữ liệu gốc của trang! (Chống trượt 100%)`);
+    } else {
+        const selectorsToTry = [".reading-detail img", ".page-chapter img", ".box_doc img", "#chapter-content img", ".story-see-content img", "img"];
+        let imageElements = [];
+        
+        for (const sel of selectorsToTry) {
+          const els = await page.$$(sel);
+          if (els.length > 3) {
+            imageElements = els;
+            sendLog(`✅ Đã nhận diện được thuật toán chứa ảnh của web qua HTML.`);
+            break;
+          }
+        }
+
+        const imgUrls = [];
+        const domainCounts = {};
+        for (const img of imageElements) {
+          const src = await img.getAttribute('src');
+          const dataSrc = await img.getAttribute('data-src');
+          const dataOriginal = await img.getAttribute('data-original');
+          const realSrc = dataOriginal || dataSrc || src;
+          
+          if (realSrc) {
+            if (realSrc.startsWith('http')) {
+                const lowerSrc = realSrc.toLowerCase();
+                if (!lowerSrc.includes('logo') && !lowerSrc.includes('icon') && !lowerSrc.includes('avatar')) {
+                  imgUrls.push(realSrc);
+                  try {
+                      const hostname = new URL(realSrc).hostname;
+                      domainCounts[hostname] = (domainCounts[hostname] || 0) + 1;
+                  } catch(e){}
+                }
+            } else if (realSrc.startsWith('data:image')) {
+                // Giữ lại các ảnh base64 (ví dụ trang web cố tình chèn base64 hoặc bị lỗi onerror)
+                imgUrls.push(realSrc);
+            }
+          }
+        }
+
+        // Tìm server ảnh chính của truyện để lọc URL rác
+        let mainDomain = '';
+        let maxCount = 0;
+        for (const [domain, count] of Object.entries(domainCounts)) {
+            if (count > maxCount) {
+                maxCount = count;
+                mainDomain = domain;
+            }
+        }
+
+        // Lọc imgUrls: chỉ giữ lại ảnh thuộc mainDomain HOẶC ảnh base64
+        let filteredUrls = [];
+        for (const url of imgUrls) {
+            if (url.startsWith('data:image')) {
+                filteredUrls.push(url);
+            } else {
+                try {
+                    if (new URL(url).hostname === mainDomain) {
+                        filteredUrls.push(url);
+                    }
+                } catch(e) {}
+            }
+        }
+
+        // Lấy danh sách ảnh từ Network chặn được (Phòng trường hợp DOM bị hỏng hoàn toàn)
+        const networkArray = Array.from(networkImgUrls).filter(url => {
+            try { return new URL(url).hostname === mainDomain; } catch(e){ return false; }
+        });
+
+        // Nếu mảng lọc được từ DOM ít hơn mảng Network thì có thể DOM bị thiếu
+        if (networkArray.length > filteredUrls.length && filteredUrls.filter(u => u.startsWith('data:image')).length === 0) {
+            urlsArray = networkArray;
+            sendLog(`🛡️ CHỐNG TRƯỢT: Khôi phục thành công ${networkArray.length - filteredUrls.length} ảnh bị ẩn nhờ Network Intercept!`);
+        } else {
+            urlsArray = filteredUrls;
+        }
+    }
+    if (urlsArray.length === 0) {
+        sendLog(`❌ Không tìm thấy ảnh nào. Trang web chặn bot, yêu cầu đăng nhập, hoặc sai cấu trúc.`);
+        await context.close();
+        res.write(`data: ${JSON.stringify({ type: 'error', message: 'Không tải được ảnh nào.' })}\n\n`);
+        return res.end();
+    }
+
+    sendLog(`📸 Bắt đầu tải ${urlsArray.length} ảnh truyện về máy...`);
+    
+    const cookies = await context.cookies();
+    const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    await context.close();
+
+    const downloadedFiles = [];
+    const failedImages = [];
+      
+    for (let i = 0; i < urlsArray.length; i++) {
+      const imgUrl = urlsArray[i];
+      let success = false;
+      let lastError = '';
+
+      if (imgUrl.startsWith('data:image')) {
+          try {
+              // Phân tích cú pháp chuỗi base64
+              const matches = imgUrl.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
+              if (matches && matches.length === 3) {
+                  let ext = `.${matches[1]}`;
+                  if (ext === '.jpeg') ext = '.jpg';
+                  const base64Data = matches[2];
+                  const filePath = path.join(outputDir, `${i + 1}${ext}`);
+                  fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+                  downloadedFiles.push(filePath);
+                  success = true;
+                  sendLog(`✅ Tải thành công ảnh ${i+1} (Dạng ảnh mã hóa Base64 ẩn trong web)`);
+              } else {
+                  lastError = 'Chuỗi base64 không hợp lệ hoặc không đúng định dạng';
+              }
+          } catch (e) {
+              lastError = e.message;
+          }
+      } else {
+          for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                const response = await axios.get(imgUrl, { 
+                    responseType: 'arraybuffer', 
+                    timeout: 15000, // 15 seconds timeout
+                    headers: { 
+                        'Referer': url,
+                        'Cookie': cookieString
+                    } 
+                });
+                let ext = '.jpg';
+                if (imgUrl.toLowerCase().includes('.png')) ext = '.png';
+                else if (imgUrl.toLowerCase().includes('.webp')) ext = '.webp';
+                
+                const filePath = path.join(outputDir, `${i + 1}${ext}`);
+                fs.writeFileSync(filePath, response.data);
+                downloadedFiles.push(filePath);
+                success = true;
+                break; // Thoát vòng lặp thử lại nếu thành công
+              } catch (e) {
+                lastError = e.message;
+                if (attempt < 3) {
+                    sendLog(`⚠️ Lỗi tải ảnh ${i+1} (Thử lại lần ${attempt}/3): Đang kết nối lại...`);
+                    await new Promise(resolve => setTimeout(resolve, 2000)); // Đợi 2s trước khi thử lại
+                }
+              }
+          }
+      }
+
+      if (!success) {
+          failedImages.push(i + 1);
+          sendLog(`❌ BỎ QUA ảnh ${i+1} sau 3 lần thử thất bại: ${lastError}`);
+      }
+    }
+    
+    if (failedImages.length > 0) {
+        sendLog(`🚨 CẢNH BÁO: Quá trình tải thiếu ${failedImages.length} ảnh (Số thứ tự: ${failedImages.join(', ')}). Nguyên nhân do server truyện chặn hoặc đứt cáp.`);
+        sendLog(`👉 LỜI KHUYÊN: Bạn có thể tự tải tay ảnh bị thiếu và chép đè vào thư mục với đúng số thứ tự đó.`);
+    }
+
+    sendLog(`🎉 ĐÃ HOÀN TẤT TẢI ${downloadedFiles.length}/${urlsArray.length} ẢNH VÀO THƯ MỤC!`);
+    res.write(`data: ${JSON.stringify({ type: 'success', data: `Đã tải xong ${downloadedFiles.length}/${urlsArray.length} ảnh vào ${outputDir}` })}\n\n`);
+    res.end();
+
+  } catch (error) {
+    if (context) await context.close();
+    res.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
+    res.end();
+  }
+});
+
+// TỰ ĐỘNG SẮP XẾP SỐ TỰ NHIÊN CHO TÊN FILE (1.jpg, 2.jpg... 10.jpg)
+const naturalCompare = (a, b) => {
+    return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+};
+
+// API ĐỂ MỞ HỘP THOẠI CHỌN FILE (CHO TÓM TẮT NHÂN VẬT)
+app.get('/api/choose-file', async (req, res) => {
+  try {
+    const tempOut = path.join(process.cwd(), 'temp_file_out.txt');
+    const psCommand = `
+      Add-Type -AssemblyName System.windows.forms;
+      $owner = New-Object System.Windows.Forms.Form;
+      $owner.TopMost = $true;
+      $owner.ShowInTaskbar = $false;
+      $owner.WindowState = 'Minimized';
+      $f = New-Object System.Windows.Forms.OpenFileDialog;
+      $f.Filter = 'Text files (*.txt)|*.txt|All files (*.*)|*.*';
+      $f.Title = 'Chon file Tom tat nhan vat';
+      if ($f.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+          [IO.File]::WriteAllText('${tempOut.replace(/\\/g, '\\\\')}', $f.FileName, [System.Text.Encoding]::UTF8)
+      } else {
+          [IO.File]::WriteAllText('${tempOut.replace(/\\/g, '\\\\')}', '', [System.Text.Encoding]::UTF8)
+      }
+    `;
+    
+    if (fs.existsSync(tempOut)) fs.unlinkSync(tempOut);
+    await execPromise(`powershell -NoProfile -Command "${psCommand.replace(/\n/g, ' ')}"`);
+    
+    let selectedPath = "";
+    if (fs.existsSync(tempOut)) {
+        selectedPath = fs.readFileSync(tempOut, 'utf8').trim();
+        // Xóa ký tự BOM nếu có
+        if (selectedPath.charCodeAt(0) === 0xFEFF) {
+            selectedPath = selectedPath.slice(1);
+        }
+        fs.unlinkSync(tempOut);
+    }
+    
+    res.json({ path: selectedPath });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to open file dialog' });
+  }
+});
+
+// API VIẾT KỊCH BẢN TỪ THƯ MỤC BẰNG QUY TRÌNH 2 BƯỚC (TWO-STEP)
+app.post('/api/generate-from-folder', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const { folderPath, loreFilePath, scriptName } = req.body;
+  
+  const sendLog = (msg) => {
+    res.write(`data: ${JSON.stringify({ type: 'log', message: msg })}\n\n`);
+  };
+
+  if (!folderPath || !fs.existsSync(folderPath)) {
+    res.write(`data: ${JSON.stringify({ type: 'error', message: 'Thư mục không tồn tại. Vui lòng kiểm tra lại.' })}\n\n`);
+    return res.end();
+  }
+
+  try {
+    sendLog(`📁 Đang quét thư mục: ${folderPath}`);
+    
+    let currentLore = "";
+    let finalLorePath = path.join(folderPath, 'Tom_Tat_Nhan_Vat.txt');
+    
+    if (loreFilePath && fs.existsSync(loreFilePath)) {
+        currentLore = fs.readFileSync(loreFilePath, 'utf8');
+        finalLorePath = loreFilePath; // Ghi đè lại file gốc
+        sendLog(`📜 Đã tải Bách khoa toàn thư nhân vật từ file sếp chọn!`);
+    } else {
+        sendLog(`📜 Không có file nhân vật. AI sẽ tự động tạo file "Tom_Tat_Nhan_Vat.txt" cho Chap này.`);
+    }
+    
+    // 1. Đọc và lọc ảnh
+    const files = fs.readdirSync(folderPath);
+    const imageFiles = files.filter(f => f.match(/\.(jpg|jpeg|png|webp)$/i)).sort(naturalCompare);
+    
+    if (imageFiles.length === 0) {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: 'Không tìm thấy ảnh nào trong thư mục này.' })}\n\n`);
+        return res.end();
+    }
+    
+    sendLog(`📸 Đã tìm thấy ${imageFiles.length} ảnh. Bắt đầu quy trình "Cao Thủ"...`);
+
+    // 2. Thuật toán Chunking (Chia nhỏ 15 ảnh/lần)
+    const chunkSize = 15;
+    const summaries = [];
+    let previousSummary = ""; // Kỹ thuật Rolling Context (Nhớ dữ liệu)
+    
+    sendLog(`🧠 BƯỚC 1: Đang trích xuất dữ liệu chi tiết từng khung hình...`);
+    
+    for (let i = 0; i < imageFiles.length; i += chunkSize) {
+        const chunkFiles = imageFiles.slice(i, i + chunkSize);
+        sendLog(`  🔍 Đang soi nhóm ảnh từ ${i + 1} đến ${i + chunkFiles.length} / ${imageFiles.length}...`);
+        
+        const uploadedFiles = [];
+        for (const file of chunkFiles) {
+            const filePath = path.join(folderPath, file);
+            const mimeType = file.toLowerCase().endsWith('.png') ? 'image/png' : file.toLowerCase().endsWith('.webp') ? 'image/webp' : 'image/jpeg';
+            const fileData = fs.readFileSync(filePath).toString("base64");
+            uploadedFiles.push({
+                inlineData: {
+                    data: fileData,
+                    mimeType: mimeType
+                }
+            });
+        }
+        
+        let extractPrompt = `Đây là phần ${Math.floor(i/chunkSize) + 1} của một chapter truyện tranh (Webtoon). 
+LƯU Ý QUAN TRỌNG VỀ ẢNH: Một bức ảnh Webtoon là một dải dài CHỨA RẤT NHIỀU "KHUNG TRANH" (Panels) nhỏ bên trong. Hệ thống cắt ngang thành nhiều ảnh rời rạc nên một khung tranh hoặc bóng thoại có thể bị cắt làm đôi (nửa ở ảnh này, nửa ở ảnh kia). Hãy tự động ĐỌC GHÉP NỐI chúng cho hoàn chỉnh.`;
+
+        if (currentLore) {
+            extractPrompt += `\n\nBÁCH KHOA TOÀN THƯ NHÂN VẬT TỪ TÁC GIẢ: ${currentLore}\n(Hãy đối chiếu đặc điểm ngoại hình trong ảnh với danh sách trên để gọi ĐÚNG TÊN nhân vật thay vì miêu tả chung chung).`;
+        }
+
+        extractPrompt += `\n\nNhiệm vụ của bạn KHÔNG PHẢI là viết kịch bản review. Bạn chỉ đóng vai trò là 'Người ghi chép'. 
+YÊU CẦU BẮT BUỘC KHI TRÍCH XUẤT:
+- Phải bóc tách và miêu tả LẦN LƯỢT TỪNG "KHUNG TRANH" (Panel) xuất hiện từ trên xuống dưới trong các bức ảnh.
+- Tuyệt đối KHÔNG ĐƯỢC gộp chung nhiều khung tranh vào một câu miêu tả. Mỗi khung tranh/hành động phải tách riêng biệt. 
+- Trích xuất ĐẦY ĐỦ các đoạn hội thoại đi kèm đúng với từng khung tranh đó. Khung tranh nào không thoại cũng phải miêu tả.
+- Phần miêu tả hành động/cảnh vật phải viết thật NGẮN GỌN, SÚC TÍCH, đi thẳng vào trọng tâm (VD: "Main vung kiếm", "Quái vật gầm thét"), không miêu tả dài dòng lê thê.`;
+        
+        if (previousSummary) {
+            extractPrompt += `\n\nLƯU Ý LIÊN KẾT: Dưới đây là tóm tắt của phần trước. Hãy đọc để NẮM BẮT ĐÚNG TÊN NHÂN VẬT, tránh việc gọi sai tên hoặc mô tả chung chung (như 'chàng trai', 'cô gái') nếu nhân vật đó đã xuất hiện ở phần trước:\n---TÓM TẮT PHẦN TRƯỚC---\n${previousSummary}`;
+        }
+        
+        const generateRes = await ai.models.generateContent({
+            model: 'gemini-3.8-flash',
+            contents: [extractPrompt, ...uploadedFiles]
+        });
+        
+        previousSummary = generateRes.text; // Lưu lại để truyền cho phần sau
+        summaries.push(`--- PHẦN ${Math.floor(i/chunkSize) + 1} ---\n${generateRes.text}`);
+    }
+
+    const fullSummaryText = summaries.join('\n\n');
+    
+    // Lưu bản tóm tắt thô Bước 1 ra file để người dùng kiểm tra
+    const summaryFilePath = path.join(folderPath, 'Tom_Tat_Buoc_1.txt');
+    fs.writeFileSync(summaryFilePath, fullSummaryText, 'utf8');
+    sendLog(`✅ Đã lưu bản nháp vào file "Tom_Tat_Buoc_1.txt".`);
+    
+    // BƯỚC 1.5: CẬP NHẬT TỪ ĐIỂN NHÂN VẬT
+    sendLog(`🧠 BƯỚC 1.5: AI đang tự động học và cập nhật Từ Điển Nhân Vật...`);
+    const updateLorePrompt = `Bạn là hệ thống lưu trữ thông tin nhân vật truyện tranh.
+Dữ liệu nhân vật cũ:
+${currentLore || "(Chưa có dữ liệu, đây là chap đầu tiên)"}
+
+Tóm tắt diễn biến Chap mới:
+${fullSummaryText}
+
+NHIỆM VỤ: Dựa vào diễn biến mới, hãy HỢP NHẤT và XUẤT RA danh sách nhân vật được cập nhật (Thêm nhân vật mới xuất hiện, hoặc bổ sung đặc điểm/vai trò của nhân vật cũ).
+Chỉ trả về nội dung danh sách rõ ràng (Tên: Ngoại hình, Tính cách, Vai trò). Không kể lể cốt truyện dài dòng.`;
+    
+    const loreRes = await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: [updateLorePrompt]
+    });
+    const updatedLore = loreRes.text;
+    fs.writeFileSync(finalLorePath, updatedLore, 'utf8');
+    sendLog(`✅ Đã cập nhật xong Bách Khoa Toàn Thư Nhân Vật vào file gốc!`);
+
+    // 3. Bước 2: Chấp bút kịch bản
+    sendLog(`✍️ BƯỚC 2: AI đang chấp bút viết kịch bản điện ảnh... (Vui lòng đợi)`);
+    
+    let finalPrompt = `Bạn là một Tiktoker/Youtuber chuyên nghiệp chuyên review truyện tranh, manga, manhwa. 
+Dưới đây là TÓM TẮT CHI TIẾT diễn biến của một chapter truyện (đã được bóc tách theo từng khung tranh). Dựa BÁM SÁT vào dữ liệu này, hãy viết một kịch bản Video Review.`;
+
+    if (updatedLore) {
+        finalPrompt += `\n\nBÁCH KHOA TOÀN THƯ NHÂN VẬT TỪ TÁC GIẢ: ${updatedLore}\n(Hãy sử dụng thông tin này để đảm bảo gọi chuẩn xác tên và đặc điểm nhân vật xuyên suốt kịch bản).`;
+    }
+
+    finalPrompt += `\n\nYÊU CẦU ĐỊNH DẠNG BẮT BUỘC (TUYỆT ĐỐI TUÂN THỦ):
+- Phải viết kịch bản LẦN LƯỢT THEO TỪNG KHUNG TRANH, KHÔNG BỎ SÓT bất kỳ khung tranh nào. Khung không thoại cũng phải miêu tả hành động, sự việc.
+- Cấu trúc: [Miêu tả khung tranh, hành động], [Trích thoại] (Ngăn cách bằng DUY NHẤT dấu phẩy ",").
+- PHẦN MIÊU TẢ PHẢI VIẾT THẬT NGẮN GỌN, SÚC TÍCH. Lược bỏ các từ ngữ dư thừa, đi thẳng vào hành động chính (VD: "Main vung kiếm", "Kẻ địch ngã gục"). TUYỆT ĐỐI KHÔNG miêu tả văn vẻ dài dòng lê thê.
+- KHÔNG LẶP TỪ: Khi miêu tả cùng một nhân vật liên tục, hãy ĐAN XEN linh hoạt giữa Tên riêng, Đại từ nhân xưng (cậu, anh, gã, hắn, y...) hoặc Danh từ chỉ người (cậu bé, thanh niên, chàng trai...) để người nghe không bị nhàm chán. KHÔNG lặp đi lặp lại một cái tên ở đầu mỗi câu.
+- KHÔNG sử dụng bất kỳ dấu câu nào khác ngoài dấu phẩy (,) và dấu chấm (.). (Tức là CẤM dùng ngoặc kép, gạch đầu dòng, dấu hai chấm, chấm hỏi, chấm than...).
+- Hết 1 KHUNG TRANH phải XUỐNG DÒNG 1 lần. Đảm bảo cấu trúc: 1 khung tranh = 1 dòng duy nhất. Không được gộp 2, 3 khung tranh vào cùng 1 dòng.
+- BỎ QUA HOÀN TOÀN phần Mở bài (chào hỏi) và Kết bài (kêu gọi). Lao thẳng trực tiếp vào kể diễn biến của chapter.
+
+Ví dụ định dạng đúng (1 dòng = 1 khung tranh, miêu tả cực ngắn gọn):
+Thanh niên vung kiếm chém tới, cút đi con quái vật.
+Quái vật gầm lên đau đớn, grừ grừ.
+Bầu trời chuyển đen kịt.
+...
+
+Chỉ trả về duy nhất nội dung kịch bản, tuân thủ chính xác các dấu câu và xuống dòng như trên.
+
+DỮ LIỆU TÓM TẮT:
+${fullSummaryText}`;
+
+    const finalRes = await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: [finalPrompt]
+    });
+    
+    // Lưu kịch bản ra file text trong thư mục chứa ảnh
+    let finalScriptName = scriptName ? scriptName.trim() : 'Kich_Ban_Review.txt';
+    if (!finalScriptName.toLowerCase().endsWith('.txt')) {
+        finalScriptName += '.txt';
+    }
+    
+    const scriptFilePath = path.join(folderPath, finalScriptName);
+    fs.writeFileSync(scriptFilePath, finalRes.text, 'utf8');
+    
+    sendLog(`🎉 ĐÃ HOÀN TẤT KỊCH BẢN! Đã tự động lưu thành file "${finalScriptName}" trong thư mục ảnh.`);
+    res.write(`data: ${JSON.stringify({ type: 'success', data: finalRes.text })}\n\n`);
+    res.end();
+
+  } catch (error) {
+    res.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
+    res.end();
+  }
+});
+
+const PORT = 3001;
+app.listen(PORT, () => {
+  console.log(`Backend server running on http://localhost:${PORT}`);
+});

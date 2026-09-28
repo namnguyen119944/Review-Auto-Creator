@@ -1,0 +1,282 @@
+app.post("/api/auto-edit-capcut", async (req, res) => {
+  req.setTimeout(1800000); // 30 mins
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  const sendLog = (msg) =>
+    res.write(`data: ${JSON.stringify({ type: "log", message: msg })}\n\n`);
+
+  try {
+    const { videoPath, srtPath, apiKey } = req.body;
+    const apiKeyManager = new ApiKeyManager(apiKey);
+
+    if (!videoPath || !fs.existsSync(videoPath))
+      throw new Error("Không tìm thấy file Video.");
+    if (!srtPath || !fs.existsSync(srtPath))
+      throw new Error("Không tìm thấy file SRT.");
+
+    const srtContent = fs.readFileSync(srtPath, "utf8");
+
+    // Phân tích SRT để tính duration
+    const blocks = [];
+    const blocksRaw = srtContent.replace(/\r\n/g, "\n").split("\n\n");
+    for (const raw of blocksRaw) {
+      const lines = raw.trim().split("\n");
+      if (lines.length >= 3) {
+        const index = parseInt(lines[0]);
+        const times = lines[1].split(" --> ");
+        if (times.length === 2) {
+          const parseTime = (t) => {
+            const [hms, ms] = t.split(",");
+            const [h, m, s] = hms.split(":");
+            return (
+              parseInt(h) * 3600000 +
+              parseInt(m) * 60000 +
+              parseInt(s) * 1000 +
+              parseInt(ms || 0)
+            );
+          };
+          const start = parseTime(times[0]);
+          const end = parseTime(times[1]);
+          blocks.push({ index, start, end, text: lines.slice(2).join(" ") });
+        }
+      }
+    }
+
+    let srtPromptList = "";
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      const prevEnd = i === 0 ? 0 : blocks[i - 1].end;
+      const targetDuration = block.end - prevEnd;
+
+      // Yêu cầu AI dư dả clip (giả sử trung bình mỗi clip 2 giây) để phòng khi random các clip bị ngắn
+      const requiredClips = Math.ceil(targetDuration / 2000) || 1;
+      block.targetDuration = targetDuration;
+      block.requiredClips = requiredClips;
+      srtPromptList += `Câu ${block.index} [Cần tìm ${requiredClips} clip]: ${block.text}\n`;
+    }
+
+    // Gói logic upload + gọi AI vào function để retry nếu API hết Quota
+    const processAI = async (aiClient) => {
+      const finalCheckFile = await uploadAndCacheVideo(
+        aiClient,
+        videoPath,
+        sendLog,
+      );
+
+      sendLog(
+        `🧠 Đang yêu cầu AI tìm các đoạn cắt khớp với từng câu SRT (Lách bản quyền)...`,
+      );
+      const prompt = `Dưới đây là danh sách các câu phụ đề kịch bản review. Mỗi câu đã được tôi tính toán sẵn SỐ LƯỢNG CLIP CẦN THIẾT để lấp đầy thời gian đọc của câu đó trên timeline.
+
+NỘI DUNG YÊU CẦU:
+${srtPromptList}
+
+NHIỆM VỤ CỦA BẠN:
+1. Xem video đính kèm.
+2. Đối với MỖI câu, hãy tìm ĐÚNG số lượng clip yêu cầu (không thừa, không thiếu). Hình ảnh trong các clip phải liên quan đến nội dung câu nói.
+3. ĐIỀU KIỆN LÁCH BẢN QUYỀN: Các clip KHÔNG được cắt liên tục một mạch (phải bị đứt gãy phân cảnh). Để lách bản quyền mà vẫn giữ được nội dung sát nghĩa, giữa các clip lấy ra chỉ cần nhảy cóc/bỏ cách nhau tối thiểu 1 giây là đủ (không cần phải cách nhau quá xa).
+4. Trả về ĐỊNH DẠNG JSON MẢNG TỔNG HỢP. Kết quả cuối cùng là một mảng JSON thuần túy (không bọc trong \`\`\`json):
+[
+  { 
+    "srt_index": 1, 
+    "clips": [
+       { "start_time_seconds": 15.2 },
+       { "start_time_seconds": 50.1 }
+    ]
+  }
+]`;
+
+      return await aiClient.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: [
+          {
+            fileData: {
+              mimeType: finalCheckFile.mimeType || "video/mp4",
+              fileUri: finalCheckFile.uri,
+            },
+          },
+          prompt,
+        ],
+      });
+    };
+
+    const response = await withRetryAndKeySwitch(
+      apiKeyManager,
+      sendLog,
+      processAI,
+    );
+
+    let jsonStr = response.text || "";
+    jsonStr = jsonStr
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+
+    let aiResults = [];
+    try {
+      aiResults = JSON.parse(jsonStr);
+    } catch (e) {
+      sendLog(
+        `⚠️ AI trả về dữ liệu không chuẩn JSON, đang cố gắng bóc tách...`,
+      );
+      const match = jsonStr.match(/\[[\s\S]*\]/);
+      if (match) {
+        aiResults = JSON.parse(match[0]);
+      } else {
+        throw new Error("Không thể parse kết quả JSON từ AI: " + jsonStr);
+      }
+    }
+
+    if (!Array.isArray(aiResults) || aiResults.length === 0) {
+      throw new Error("AI không trả về được danh sách phân đoạn nào.");
+    }
+
+    sendLog(
+      `✅ AI đã phân tích xong. Bắt đầu đẩy lên CapCut Draft với thuật toán Random Timeline...`,
+    );
+
+    const projectName = `Auto_Anime_${Date.now()}`;
+    await execPromise(`npx capcut-cli init "${projectName}"`);
+
+    // TÌM ĐƯỜNG DẪN ABSOLUTE TỚI CAPCUT DRAFT (Windows)
+    const capcutDraftsPath = path.join(
+      process.env.LOCALAPPDATA || process.env.APPDATA,
+      "CapCut",
+      "User Data",
+      "Projects",
+      "com.lveditor.draft",
+    );
+    const draftPath = path.join(capcutDraftsPath, projectName);
+
+    sendLog(`📁 Đã tạo dự án CapCut mới: ${projectName} tại ${draftPath}`);
+
+    // Tạo thư mục tạm để chứa các clip cắt ra
+    const tempClipsDir = path.join(process.cwd(), "temp_clips_" + Date.now());
+    if (!fs.existsSync(tempClipsDir)) {
+      fs.mkdirSync(tempClipsDir);
+    }
+
+    // Lấy tổng thời lượng video gốc để chống lỗi AI chém gió thời gian vượt quá video
+    let maxDuration = 10000;
+    try {
+      const durStr = await execPromise(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`,
+      );
+      if (durStr && parseFloat(durStr) > 0) {
+        maxDuration = parseFloat(durStr);
+        sendLog(`⏱ Tổng thời lượng video gốc: ${maxDuration.toFixed(1)} giây.`);
+      }
+    } catch (e) {}
+
+    let currentTimelineSec = 0; // Thời gian chạy nối tiếp trên timeline của CapCut
+    let lastValidStartSeconds = 10; // Đưa ra ngoài vòng lặp để đảm bảo tịnh tiến liên tục
+
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      const aiBlock = aiResults.find((c) => c.srt_index == block.index) || {
+        clips: [],
+      };
+      let remainingDuration = block.targetDuration;
+
+      let clipIdx = 0;
+
+      while (remainingDuration > 0) {
+        const minClipMs = 1500;
+        const maxClipMs = 4000;
+        let randomDurMs =
+          Math.floor(Math.random() * (maxClipMs - minClipMs + 1)) + minClipMs;
+
+        let useDuration = Math.min(randomDurMs, remainingDuration);
+        if (remainingDuration - useDuration < 1000) {
+          useDuration = remainingDuration;
+        }
+
+        let startSeconds = 0;
+        if (aiBlock.clips && aiBlock.clips[clipIdx]) {
+          startSeconds =
+            parseFloat(aiBlock.clips[clipIdx].start_time_seconds) ||
+            lastValidStartSeconds + 1;
+        } else {
+          startSeconds = lastValidStartSeconds + useDuration / 1000 + 1.5; // Nhảy cóc 1.5s để lách bản quyền
+        }
+
+        // CHỐNG TRÀN THỜI GIAN (AI bị ngáo hoặc tịnh tiến quá đà)
+        if (startSeconds + useDuration / 1000 >= maxDuration) {
+          startSeconds = 10; // Reset quay lại đầu video
+        }
+        lastValidStartSeconds = startSeconds;
+
+        const startSec = startSeconds.toFixed(3);
+        const durationSec = (useDuration / 1000).toFixed(3);
+
+        // CẮT VIDEO GỐC BẰNG FFMPEG (SIÊU TỐC, ĐẢM BẢO KHÔNG BỊ LỆCH KHUNG HÌNH)
+        const clipName = `clip_${block.index}_${clipIdx}.mp4`;
+        const clipPath = path.join(tempClipsDir, clipName);
+
+        try {
+          sendLog(
+            `✂️ Đang trích xuất đoạn ${clipName} (từ ${startSec}s, dài ${durationSec}s)...`,
+          );
+          // Thêm -pix_fmt yuv420p để fix lỗi màn hình đen với anime MKV 10-bit
+          await execPromise(
+            `ffmpeg -y -ss ${startSec} -i "${videoPath}" -t ${durationSec} -map 0:v:0 -map 0:a:0? -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac "${clipPath}"`,
+          );
+
+          // CHÈN VÀO TIMELINE CAPCUT NỐI TIẾP NHAU
+          await execPromise(
+            `npx capcut-cli add-video "${draftPath}" "${clipPath}" ${currentTimelineSec.toFixed(3)} ${durationSec} --force-write`,
+          );
+
+          // Cộng dồn thời gian để clip sau chèn tiếp vào đuôi clip trước
+          currentTimelineSec += useDuration / 1000;
+        } catch (err) {
+          sendLog(
+            `⚠️ Lỗi cắt/chèn đoạn video cho SRT ${block.index}: ${err.message}`,
+          );
+          // Vẫn phải cộng thời gian để khỏi lệch SRT
+          currentTimelineSec += useDuration / 1000;
+        }
+
+        remainingDuration -= useDuration;
+        clipIdx++;
+      }
+    }
+
+    sendLog(`📝 Đang chèn phụ đề SRT vào timeline...`);
+    try {
+      await execPromise(
+        `npx capcut-cli import-srt "${draftPath}" "${srtPath}" --force-write`,
+      );
+    } catch (err) {
+      sendLog(`⚠️ Lỗi import SRT: ${err.message}`);
+    }
+
+    try {
+      if (fs.existsSync(tempClipsDir)) {
+        fs.rmSync(tempClipsDir, { recursive: true, force: true });
+        sendLog(`🧹 Đã dọn dẹp các file video tạm.`);
+      }
+    } catch (e) {}
+
+    sendLog(
+      `🎉 HOÀN TẤT! Hãy mở CapCut PC lên, bạn sẽ thấy dự án "${projectName}" đã được cắt ghép sẵn!`,
+    );
+    res.write(
+      `data: ${JSON.stringify({ type: "success", data: "Tuyệt vời! Auto Edit đã đẩy sang CapCut thành công." })}\n\n`,
+    );
+  } catch (error) {
+    sendLog(`❌ LỖI: ${error.message}`);
+    res.write(
+      `data: ${JSON.stringify({ type: "error", message: error.message })}\n\n`,
+    );
+  }
+  res.end();
+});
+
+const PORT = 3001;
+app.listen(PORT, () => {
+  console.log(`Backend server running on http://localhost:${PORT}`);
+});
